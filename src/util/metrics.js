@@ -16,4 +16,7 @@ module.exports = {
 
   // Submissions persisted.
   SUBMISSION_CREATED: 'formio.submission.created',
+
+  // How long one report (GET /form/:formId/report) took to compute, in milliseconds.
+  REPORT_DURATION: 'formio.report.duration',
 };

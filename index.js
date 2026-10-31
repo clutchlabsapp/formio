@@ -284,6 +284,9 @@ module.exports = function (config) {
           // Add submission data export capabilities.
           require('./src/export/export')(router);
 
+          // Grouped totals over submissions (admins' reports in the portal).
+          require('./src/report/report')(router);
+
           // Add the available templates.
           router.formio.templates = {
             default: _.cloneDeep(require('./src/templates/default.json')),

@@ -77,7 +77,11 @@ describe('hook.instrument', function () {
 });
 
 describe('Metric hook vocabulary', function () {
-  const METRIC_NAMES = ['formio.submission.field_handlers', 'formio.submission.created'];
+  const METRIC_NAMES = [
+    'formio.submission.field_handlers',
+    'formio.submission.created',
+    'formio.report.duration',
+  ];
 
   it('declares every metric name formio reports', function () {
     assert.deepStrictEqual(Object.values(metrics).sort(), [...METRIC_NAMES].sort());
