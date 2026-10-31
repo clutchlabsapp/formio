@@ -95,6 +95,26 @@ never inline at a call site; a test asserts `src/` mentions each one only in tha
 instrument _kind_ behind each name (counter, histogram, gauge, units, buckets) is the
 implementation's decision, not this package's.
 
+## Linked records and linked rows
+
+Shared code in [`src/util/linkedRecords.js`](./src/util/linkedRecords.js) (find reference
+components, walk values through grid rows, load linked submissions with read_all/read_own,
+`submissionQuery` and protected-field gates) and [`src/util/linkedRows.js`](./src/util/linkedRows.js)
+(a grid's `linkedRows` setting: map, merge, prefill). Routes live in
+[`src/resources/SubmissionResource.js`](./src/resources/SubmissionResource.js):
+
+- `GET /form/:formId/submission[/:id]?expand=a,b.c` — replace references with live records (max two hops).
+- `GET /form/:formId/submission/:id/related` — forms and fields that link to a record, with counts.
+- `POST /form/:formId/prefill` `{ data, changed? }` — computed rows for each linked grid.
+  `params.js` maps `prefill` (and `report`) onto the submission collection like `export`, so
+  prefill needs create access and reports need index read access, not form edit access.
+
+Alter hooks added for this (formio-server implements none yet):
+
+| Hook | Shape | Purpose |
+| --- | --- | --- |
+| `linkedRowsOperations` | sync: `(operations) => operations` | Add or replace mapping operations. Each is `(resolvedArgs[]) => value`; never evaluate user code. |
+
 ## Hot paths & gotchas
 
 See [`/docs/gotchas/formio.md`](../../docs/gotchas/formio.md). Current entries:

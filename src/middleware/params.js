@@ -24,7 +24,15 @@ module.exports = (router) => {
       params.hasOwnProperty('role') && params.role !== 'undefined' ? params.role : null;
 
     // FA-993 - Update the request to check submission index in the case of submission exports.
-    if (subId === null && formId !== null && params.hasOwnProperty('export')) {
+    // Reports read the submission index the same way; linked-rows prefill is checked like
+    // creating a submission (POST on the submission collection), not like editing the form.
+    if (
+      subId === null &&
+      formId !== null &&
+      (params.hasOwnProperty('export') ||
+        params.hasOwnProperty('report') ||
+        params.hasOwnProperty('prefill'))
+    ) {
       subId = '';
     }
 

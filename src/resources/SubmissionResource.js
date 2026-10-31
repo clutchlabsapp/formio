@@ -9,6 +9,7 @@ module.exports = (router) => {
   const handlers = router.formio.middleware.submissionHandler;
   const hiddenFields = ['deleted', '__v', 'machineName'];
   const linked = require('../util/linkedRecords')(router);
+  const linkedRows = require('../util/linkedRows')(router);
 
   // `?expand=customer,lines.product` replaces references at those paths with the live
   // records they point to (read through the caller's own access). Taken off the query
@@ -181,6 +182,32 @@ module.exports = (router) => {
     } catch (err) {
       log.error({ err }, 'failed to find related records');
       return res.status(500).send('Internal server error');
+    }
+  });
+
+  // Linked rows: compute the rows of every grid with a `linkedRows` setting from the records
+  // currently picked in `data`. `changed` (optional) limits it to grids fed by that field.
+  // params.js maps this route to the submission collection, so it needs create access.
+  router.post('/form/:formId/prefill', async (req, res) => {
+    const log = req.log.child({ module: 'formio:linkedRows' });
+    try {
+      const form = await router.formio.cache.loadCurrentForm(req);
+      if (!form) {
+        return res.status(404).send('Form not found');
+      }
+      const data = _.isPlainObject(_.get(req.body, 'data')) ? req.body.data : {};
+      const changed = typeof req.body.changed === 'string' ? req.body.changed : null;
+      const started = Date.now();
+      log.debug({ formId: form._id, changed }, 'prefilling linked rows');
+      const rows = await linkedRows.prefill(req, form, data, changed, log);
+      log.debug(
+        { formId: form._id, grids: Object.keys(rows).length, ms: Date.now() - started },
+        'prefilled linked rows',
+      );
+      return res.status(200).json({ data: rows });
+    } catch (err) {
+      log.error({ err }, 'failed to prefill linked rows');
+      return res.status(400).send(err.message);
     }
   });
 
