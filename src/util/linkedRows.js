@@ -17,7 +17,7 @@ const util = require('./util');
 //     "sync": "onPick" | "live"       // onPick keeps edits to generated rows; live recomputes
 //   }
 //
-// Expressions: "$item...", "$source...", "$record..." read a value (a linked record found there
+// Expressions: "$item...", "$source...", "$record..." read a value ("$target..." in a limit) (a linked record found there
 // is stored as a `{ _id }` link); any other string, number or boolean is a literal; an object
 // with one key from OPERATIONS computes a value from its argument list.
 //
@@ -115,7 +115,7 @@ const normalizeSettings = (raw) => {
  */
 const evaluate = (expression, context, operations) => {
   if (typeof expression === 'string') {
-    const match = expression.match(/^(\$item|\$source|\$record)(?:\.(.+))?$/);
+    const match = expression.match(/^(\$item|\$source|\$record|\$target)(?:\.(.+))?$/);
     if (!match) {
       return expression;
     }
@@ -146,6 +146,8 @@ const buildRow = (settings, context, origin, operations) => {
   row[LINKED_KEY] = { from: [origin] };
   return row;
 };
+
+const linkId = (value) => (isRecord(value) && value._id ? value._id.toString() : null);
 
 const rowIdentity = (row) => {
   const from = _.get(row, [LINKED_KEY, 'from', 0]);
@@ -256,16 +258,16 @@ module.exports = (router) => {
   };
 
   /**
-   * Compute a grid's rows from the records currently picked in `data`.
+   * Build one row per list item of every record currently picked in `data` (not yet merged).
    */
-  const computeGridRows = async (req, form, grid, data, log) => {
+  const generateRows = async (req, form, grid, data, log) => {
     const { settings } = grid;
     const sourceRef = linked
       .getReferenceComponents(form)
       .find((ref) => ref.path === settings.source);
     if (!sourceRef) {
       log.debug({ formId: form._id, grid: grid.path }, 'linkedRows source is not a reference');
-      return _.get(data, grid.path, []);
+      return null;
     }
 
     // Each pick: the record id and the object holding it (a grid row of picks, or the form).
@@ -320,10 +322,26 @@ module.exports = (router) => {
         );
       });
     });
+    log.trace({ grid: grid.path, generated: generated.length }, 'generated linked rows');
+    return generated;
+  };
 
-    const rows = mergeRows(settings, _.get(data, grid.path), generated);
+  /**
+   * Compute a grid's rows from the records currently picked in `data`.
+   */
+  const computeGridRows = async (req, form, grid, data, log) => {
+    const generated = await generateRows(req, form, grid, data, log);
+    if (!generated) {
+      return _.get(data, grid.path, []);
+    }
+    const rows = mergeRows(grid.settings, _.get(data, grid.path), generated);
     log.debug(
-      { grid: grid.path, merge: settings.merge, generated: generated.length, rows: rows.length },
+      {
+        grid: grid.path,
+        merge: grid.settings.merge,
+        generated: generated.length,
+        rows: rows.length,
+      },
       'computed linked rows',
     );
     return rows;
@@ -347,6 +365,316 @@ module.exports = (router) => {
     return result;
   };
 
+  // ---------------------------------------------------------------------------------------
+  // Save time. The server decides which submitted rows came from a pick by matching them to
+  // the rows it would generate itself, never by trusting a `_linked` value sent by the client.
+
+  const rowsOf = (data, path) => {
+    const rows = _.get(data, path);
+    return Array.isArray(rows) ? rows : [];
+  };
+
+  // Match each expected (generated, or combined) row to a submitted row. A row matches on the
+  // columns that hold links (or, for combine, on the key columns); with neither, on the origin
+  // the client echoed back. Returns an array aligned with `rows`: the expected row or null.
+  const matchRows = (settings, expected, rows, clientMarks) => {
+    const matched = rows.map(() => null);
+    const identity = (row, columns) =>
+      JSON.stringify(columns.map((column) => linkId(row[column]) || row[column]));
+    expected.forEach((want) => {
+      let index = -1;
+      if (settings.merge === 'combine') {
+        const wanted = keyIdentity(settings, want);
+        index = rows.findIndex((row, i) => !matched[i] && keyIdentity(settings, row) === wanted);
+      } else {
+        const columns = Object.keys(settings.map).filter((column) => linkId(want[column]));
+        if (columns.length) {
+          const wanted = identity(want, columns);
+          index = rows.findIndex((row, i) => !matched[i] && identity(row, columns) === wanted);
+        } else {
+          const wanted = rowIdentity(want);
+          index = rows.findIndex(
+            (row, i) => !matched[i] && rowIdentity({ [LINKED_KEY]: clientMarks[i] }) === wanted,
+          );
+        }
+      }
+      if (index !== -1) {
+        matched[index] = want;
+      }
+    });
+    return matched;
+  };
+
+  const validationError = (details) => ({
+    name: 'ValidationError',
+    details: details.map(({ message, path }) => ({ message, path: path.split('.'), context: {} })),
+  });
+
+  // Count rows per linked target id at `grid.field`.
+  const countTargets = (rows, field) => {
+    const counts = new Map();
+    rows.forEach((row) => {
+      const id = isRecord(row) ? linkId(row[field]) : null;
+      if (id) {
+        counts.set(id, (counts.get(id) || 0) + 1);
+      }
+    });
+    return counts;
+  };
+
+  /**
+   * Link limits: cap how many rows across this form may link to one target record. The count
+   * lives on the target (`metadata.linkCounts`) and moves with a conditional `$inc`, so two
+   * saves racing for the last place cannot both win. Works without transactions.
+   */
+  const reserveLimits = async (req, form, grid, rows, previousRows, log) => {
+    const { limit } = grid.settings;
+    const reservations = [];
+    if (!limit || typeof limit.field !== 'string') {
+      return { reservations };
+    }
+    const targetRef = linked
+      .getReferenceComponents(form)
+      .find((ref) => ref.path === `${grid.path}.${limit.field}`);
+    if (!targetRef) {
+      log.debug(
+        { grid: grid.path, field: limit.field },
+        'linkedRows limit field is not a reference',
+      );
+      return { reservations };
+    }
+    const now = countTargets(rows, limit.field);
+    const before = countTargets(previousRows, limit.field);
+    const targets = _.uniq([...now.keys(), ...before.keys()]);
+    const counterKey = `metadata.linkCounts.${`${form._id}_${grid.path}_${limit.field}`.replace(
+      /[.$]/g,
+      '_',
+    )}`;
+    const targetForm = await router.formio.cache.loadForm(req, null, targetRef.formId);
+    const model = await linked.withSubmissionModel(req, targetForm, async (found) => found);
+    const ownModel = await linked.withSubmissionModel(req, form, async (found) => found);
+    const ops = operations();
+
+    for (const target of targets) {
+      const delta = (now.get(target) || 0) - (before.get(target) || 0);
+      if (!delta) {
+        continue;
+      }
+      if (delta < 0) {
+        // Released only once the save succeeds.
+        reservations.push({ model, target, counterKey, delta, settled: false, onSuccess: true });
+        continue;
+      }
+      const record = await model
+        .findOne({ _id: util.ObjectId(target), deleted: { $eq: null } })
+        .lean();
+      if (!record) {
+        continue;
+      }
+      const max = toNumber(
+        evaluate(limit.max, { $item: record, $target: record, $record: record }, ops),
+      );
+      if (max === null) {
+        continue;
+      }
+      // Seed the counter from the rows that already exist the first time a target is limited.
+      if (!_.has(record, counterKey)) {
+        const idMatch = { $in: [util.ObjectId(target), target] };
+        const linkPath = `data.${grid.path}.${limit.field}._id`;
+        const match = { form: form._id, deleted: { $eq: null }, [linkPath]: idMatch };
+        if (req.subId) {
+          match._id = { $ne: util.ObjectId(req.subId) };
+        }
+        const [counted] = await ownModel.aggregate([
+          { $match: match },
+          { $unwind: `$data.${grid.path}` },
+          { $match: { [linkPath]: idMatch } },
+          { $count: 'n' },
+        ]);
+        const existing = (counted ? counted.n : 0) + (before.get(target) || 0);
+        await model.updateOne(
+          { _id: record._id, [counterKey]: { $exists: false } },
+          { $set: { [counterKey]: existing } },
+        );
+        log.debug({ target, existing }, 'seeded link limit counter');
+      }
+      const reserved = await model.updateOne(
+        { _id: record._id, [counterKey]: { $lte: max - delta } },
+        { $inc: { [counterKey]: delta } },
+      );
+      if (!reserved.modifiedCount) {
+        log.info({ grid: grid.path, target, max }, 'link limit reached');
+        return {
+          reservations,
+          error: {
+            message: `${grid.component.label || grid.path}: ${target} has no places left (limit ${max})`,
+            path: `${grid.path}.${limit.field}`,
+          },
+        };
+      }
+      log.debug({ grid: grid.path, target, delta }, 'reserved link limit places');
+      reservations.push({ model, target, counterKey, delta, settled: false, onSuccess: false });
+    }
+    return { reservations };
+  };
+
+  /**
+   * Finish reservations once the outcome of the save is known: on success apply the releases
+   * (rows removed); on failure give back the places reserved.
+   */
+  const settle = async (reservations, success, log) => {
+    for (const reservation of reservations) {
+      if (reservation.settled) {
+        continue;
+      }
+      reservation.settled = true;
+      const apply = success ? reservation.onSuccess : !reservation.onSuccess;
+      if (!apply) {
+        continue;
+      }
+      const delta = success ? reservation.delta : -reservation.delta;
+      await reservation.model.updateOne(
+        { _id: util.ObjectId(reservation.target), [reservation.counterKey]: { $exists: true } },
+        { $inc: { [reservation.counterKey]: delta } },
+      );
+      log.debug({ target: reservation.target, delta, success }, 'settled link limit places');
+    }
+  };
+
+  /**
+   * Check and prepare a submission's linked grids before it is saved.
+   *
+   * @return {Promise<{ errors: Array, marks: object, reservations: Array }>}
+   *   marks: { [gridPath]: Array<_linked|null> } aligned with the submitted rows, to re-attach
+   *   after validation (which drops keys no component owns).
+   */
+  const prepareSave = async (req, form, data, previousData, log) => {
+    const result = { errors: [], marks: {}, reservations: [] };
+    const grids = getLinkedGrids(form, log);
+    for (const grid of grids) {
+      const { settings } = grid;
+      const rows = rowsOf(data, grid.path);
+      const previousRows = rowsOf(previousData, grid.path);
+      const clientMarks = rows.map((row) => (isRecord(row) ? row[LINKED_KEY] : null));
+
+      const generated = await generateRows(req, form, grid, data, log);
+      if (generated) {
+        const expected =
+          settings.merge === 'combine' ? mergeRows(settings, [], generated) : generated;
+        const matched = matchRows(settings, expected, rows, clientMarks);
+
+        // lock: every row a pick generates must still be there.
+        if (settings.lock) {
+          expected
+            .filter((want) => !matched.includes(want))
+            .forEach((want) => {
+              const origin = want[LINKED_KEY].from[0];
+              result.errors.push({
+                message: `${grid.component.label || grid.path}: a row from ${origin.record} is required and cannot be removed`,
+                path: grid.path,
+              });
+            });
+        }
+
+        // readOnly: generated values cannot be edited. On an update, a row keeps the value it
+        // was saved with (a price frozen at order time stays frozen).
+        if (settings.readOnly.length) {
+          const previousMatched = previousRows.length
+            ? matchRows(
+                settings,
+                expected,
+                previousRows,
+                previousRows.map(() => null),
+              )
+            : [];
+          matched.forEach((want, index) => {
+            if (!want) {
+              return;
+            }
+            const previousIndex = previousMatched.indexOf(want);
+            const source = previousIndex !== -1 ? previousRows[previousIndex] : want;
+            settings.readOnly.forEach((column) => {
+              if (_.has(source, column)) {
+                rows[index][column] = _.cloneDeep(source[column]);
+              }
+            });
+          });
+        }
+
+        result.marks[grid.path] = matched.map((want) => (want ? want[LINKED_KEY] : null));
+      }
+
+      const limits = await reserveLimits(req, form, grid, rows, previousRows, log);
+      result.reservations.push(...limits.reservations);
+      if (limits.error) {
+        result.errors.push(limits.error);
+      }
+    }
+    result.errors = hook.alter('linkedRowsValidate', result.errors, {
+      req,
+      form,
+      data,
+      previousData,
+    });
+    return result;
+  };
+
+  /**
+   * Give back the link-limit places a deleted submission's rows held.
+   */
+  const releaseLimits = async (req, form, data, log) => {
+    const reservations = [];
+    for (const grid of getLinkedGrids(form, log)) {
+      if (!grid.settings.limit) {
+        continue;
+      }
+      const limits = await reserveLimits(req, form, grid, [], rowsOf(data, grid.path), log);
+      reservations.push(...limits.reservations);
+    }
+    await settle(reservations, true, log);
+  };
+
+  /**
+   * Put the server-made `_linked` markers back on the rows after validation.
+   */
+  const restoreMarks = (data, marks) => {
+    _.each(marks, (gridMarks, path) => {
+      const rows = rowsOf(data, path);
+      rows.forEach((row, index) => {
+        if (!isRecord(row)) {
+          return;
+        }
+        if (gridMarks[index]) {
+          row[LINKED_KEY] = gridMarks[index];
+        } else {
+          delete row[LINKED_KEY];
+        }
+      });
+    });
+  };
+
+  /**
+   * Merge picks into an existing submission's data and recompute the grid. Used by the push
+   * endpoint: `picks` holds values for the grid's source, e.g. { recipes: [{ recipe, servings }] }.
+   */
+  const pushPicks = async (req, form, grid, data, picks, log) => {
+    const next = _.cloneDeep(data || {});
+    const { source } = grid.settings;
+    const [top] = source.split('.');
+    const incoming = _.get(picks, top);
+    if (incoming === undefined) {
+      return { error: `push body must include data.${top}` };
+    }
+    const current = _.get(next, top);
+    if (source.includes('.') || Array.isArray(current) || Array.isArray(incoming)) {
+      _.set(next, top, [...[].concat(current || []), ...[].concat(incoming)]);
+    } else {
+      _.set(next, top, incoming);
+    }
+    _.set(next, grid.path, await computeGridRows(req, form, grid, next, log));
+    return { data: next };
+  };
+
   return {
     LINKED_KEY,
     OPERATIONS,
@@ -354,8 +682,15 @@ module.exports = (router) => {
     evaluate,
     mergeRows,
     getLinkedGrids,
+    generateRows,
     computeGridRows,
     prefill,
+    prepareSave,
+    restoreMarks,
+    settle,
+    releaseLimits,
+    pushPicks,
+    validationError,
   };
 };
 

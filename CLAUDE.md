@@ -106,6 +106,13 @@ components, walk values through grid rows, load linked submissions with read_all
 - `GET /form/:formId/submission[/:id]?expand=a,b.c` — replace references with live records (max two hops).
 - `GET /form/:formId/submission/:id/related` — forms and fields that link to a record, with counts.
 - `POST /form/:formId/prefill` `{ data, changed? }` — computed rows for each linked grid.
+- `PUT /form/:formId/submission/:id/rows/:grid` `{ data: { <source>: picks } }` — merge picks into an
+  existing record and save it through the normal update path (a sub-request PUT).
+- On POST/PUT, `prepareLinkedRows` (before `submissionHandler`) enforces `lock`, `readOnly` and
+  `limit`, and `restoreLinkedRows` (after it) re-attaches the server-made `_linked` row markers that
+  validation strips. Link-limit counters live on the target record at `metadata.linkCounts.*`,
+  move by conditional `$inc`, settle on `res` `finish`, and are released in `afterDelete`. Writes
+  that bypass the resource (bulk routes, direct DB edits) do not move them.
   `params.js` maps `prefill` (and `report`) onto the submission collection like `export`, so
   prefill needs create access and reports need index read access, not form edit access.
 
@@ -114,6 +121,7 @@ Alter hooks added for this (formio-server implements none yet):
 | Hook | Shape | Purpose |
 | --- | --- | --- |
 | `linkedRowsOperations` | sync: `(operations) => operations` | Add or replace mapping operations. Each is `(resolvedArgs[]) => value`; never evaluate user code. |
+| `linkedRowsValidate` | sync: `(errors, { req, form, data, previousData }) => errors` | Add save rules (e.g. time clashes). Each error is `{ message, path }`; any error rejects the save with 400. |
 
 ## Hot paths & gotchas
 

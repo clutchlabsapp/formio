@@ -3,6 +3,7 @@
 const ResourceFactory = require('resourcejs');
 const Resource = ResourceFactory.Resource;
 const _ = require('lodash');
+const util = require('../util/util');
 
 module.exports = (router) => {
   const hook = require('../util/hook')(router.formio);
@@ -39,6 +40,93 @@ module.exports = (router) => {
     }
   };
 
+  // Linked rows on save: check lock / readOnly / link limits on the submitted data, then put
+  // the server-made `_linked` row markers back after validation (which drops keys no
+  // component owns). Reservations against link limits settle when the response finishes.
+  const prepareLinkedRows = async (req, res, next) => {
+    // Sub-requests clone the parent request; never carry its markers into another form.
+    delete req.linkedRowsMarks;
+    delete req.linkedRowsSettle;
+    if (!req.body || !_.isPlainObject(req.body.data)) {
+      return next();
+    }
+    const log = req.log.child({ module: 'formio:linkedRows' });
+    try {
+      const form = await router.formio.cache.loadCurrentForm(req);
+      if (!form || !linkedRows.getLinkedGrids(form, log).length) {
+        return next();
+      }
+      const started = Date.now();
+      let previous = req.previousSubmission;
+      if (!previous && req.method === 'PUT' && req.subId) {
+        // loadPreviousSubmission keys off body._id, which an API client may leave out.
+        previous = await router.formio.cache.loadSubmission(req, req.formId, req.subId);
+      }
+      const previousData = _.get(previous, 'data') || {};
+      const prepared = await linkedRows.prepareSave(req, form, req.body.data, previousData, log);
+      let settled = false;
+      const settle = async (success) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        try {
+          await linkedRows.settle(prepared.reservations, success, log);
+        } catch (err) {
+          log.error({ err }, 'failed to settle link limit places');
+        }
+      };
+      req.linkedRowsSettle = settle;
+      if (typeof res.on === 'function') {
+        res.on('finish', () => settle(res.statusCode < 400));
+      }
+      log.debug(
+        {
+          formId: form._id,
+          errors: prepared.errors.length,
+          reservations: prepared.reservations.length,
+          ms: Date.now() - started,
+        },
+        'checked linked rows',
+      );
+      if (prepared.errors.length) {
+        await settle(false);
+        return res.status(400).json(linkedRows.validationError(prepared.errors));
+      }
+      req.linkedRowsMarks = prepared.marks;
+      return next();
+    } catch (err) {
+      log.error({ err }, 'failed to check linked rows');
+      return next(err);
+    }
+  };
+  const restoreLinkedRows = (req, res, next) => {
+    if (req.linkedRowsMarks && req.body && req.body.data) {
+      linkedRows.restoreMarks(req.body.data, req.linkedRowsMarks);
+      req.log.trace(
+        { module: 'formio:linkedRows', grids: Object.keys(req.linkedRowsMarks).length },
+        'restored linked row markers',
+      );
+    }
+    next();
+  };
+  // A deleted submission gives back the link-limit places its rows held.
+  const releaseLinkedRows = async (req, res, next) => {
+    const previous = req.previousSubmission;
+    if (!previous || !previous.data) {
+      return next();
+    }
+    const log = req.log.child({ module: 'formio:linkedRows' });
+    try {
+      const form = await router.formio.cache.loadCurrentForm(req);
+      await linkedRows.releaseLimits(req, form, previous.data, log);
+      return next();
+    } catch (err) {
+      log.error({ err }, 'failed to release link limit places');
+      return next();
+    }
+  };
+
   // Manually update the handlers, to add additional middleware.
   handlers.beforePost = [
     router.formio.middleware.filterIdCreate,
@@ -49,7 +137,9 @@ module.exports = (router) => {
     router.formio.middleware.bootstrapSubmissionAccess,
     router.formio.middleware.addSubmissionResourceAccess,
     router.formio.middleware.condenseSubmissionPermissionTypes,
+    prepareLinkedRows,
     handlers.beforePost,
+    restoreLinkedRows,
   ];
   handlers.afterPost = [
     handlers.afterPost,
@@ -92,7 +182,9 @@ module.exports = (router) => {
     router.formio.middleware.addSubmissionResourceAccess,
     router.formio.middleware.condenseSubmissionPermissionTypes,
     router.formio.middleware.loadPreviousSubmission,
+    prepareLinkedRows,
     handlers.beforePut,
+    restoreLinkedRows,
   ];
   handlers.afterPut = [
     handlers.afterPut,
@@ -147,6 +239,7 @@ module.exports = (router) => {
   ];
   handlers.afterDelete = [
     handlers.afterDelete,
+    releaseLinkedRows,
     router.formio.middleware.filterResourcejsResponse(hiddenFields),
     router.formio.middleware.filterProtectedFields('delete', (req) =>
       router.formio.cache.getCurrentFormId(req),
@@ -207,6 +300,99 @@ module.exports = (router) => {
       return res.status(200).json({ data: rows });
     } catch (err) {
       log.error({ err }, 'failed to prefill linked rows');
+      return res.status(400).send(err.message);
+    }
+  });
+
+  // Push: merge picks into an existing record's linked grid (e.g. add a recipe to an existing
+  // shopping list) and save through the normal update path, so permissions, validation,
+  // actions and the linked-rows rules all apply. The global permissionHandler has already
+  // required update access to the record.
+  router.put('/form/:formId/submission/:submissionId/rows/:field', async (req, res) => {
+    const log = req.log.child({ module: 'formio:linkedRows' });
+    try {
+      const form = await router.formio.cache.loadCurrentForm(req);
+      const grid = linkedRows
+        .getLinkedGrids(form, log)
+        .find((candidate) => candidate.path === req.params.field);
+      if (!grid) {
+        return res.status(404).send('No linked grid with that key');
+      }
+      const submission = await router.formio.cache.loadSubmission(
+        req,
+        req.params.formId,
+        req.params.submissionId,
+      );
+      if (!submission) {
+        return res.status(404).send('Not found');
+      }
+      const picks = _.isPlainObject(_.get(req.body, 'data')) ? req.body.data : {};
+      const pushed = await linkedRows.pushPicks(req, form, grid, submission.data, picks, log);
+      if (pushed.error) {
+        return res.status(400).send(pushed.error);
+      }
+      log.debug(
+        { submissionId: submission._id, grid: grid.path },
+        'saving pushed linked rows through the update path',
+      );
+
+      const childReq = util.createSubRequest(req);
+      if (!childReq) {
+        return res.status(400).send('Too many recursive requests.');
+      }
+      const url = '/form/:formId/submission/:submissionId';
+      childReq.noResponse = true;
+      childReq.method = 'PUT';
+      childReq.url = url;
+      childReq.query = {};
+      childReq.params = {
+        ...childReq.params,
+        formId: req.params.formId,
+        submissionId: req.params.submissionId,
+      };
+      childReq.formId = req.params.formId;
+      childReq.subId = req.params.submissionId;
+      childReq.body = {
+        _id: submission._id.toString(),
+        form: form._id.toString(),
+        data: pushed.data,
+      };
+
+      const outcome = await new Promise((resolve) => {
+        let done = false;
+        const finish = (err) => {
+          if (!done) {
+            done = true;
+            resolve(err);
+          }
+        };
+        const childRes = util.createSubResponse((body) => {
+          // A handler that answers directly (a validation error) never calls next.
+          if (childRes.statusCode >= 400) {
+            childRes.errorBody = body;
+            finish();
+          }
+        });
+        childReq.childRes = childRes;
+        router.resourcejs[url].put.call(this, childReq, childRes, finish);
+      });
+      const childRes = childReq.childRes;
+      const resource = childRes.resource || {};
+      const status =
+        childRes.statusCode >= 400 ? childRes.statusCode : resource.status || (outcome ? 400 : 200);
+      if (childReq.linkedRowsSettle) {
+        await childReq.linkedRowsSettle(status < 400);
+      }
+      if (status >= 400) {
+        log.debug({ submissionId: submission._id, status }, 'pushed linked rows were rejected');
+        const body = childRes.errorBody || resource.error || outcome;
+        return res
+          .status(status)
+          .json(body && body.message && !body.details ? { message: body.message } : body);
+      }
+      return res.status(200).json(resource.item);
+    } catch (err) {
+      log.error({ err }, 'failed to push linked rows');
       return res.status(400).send(err.message);
     }
   });

@@ -23,10 +23,11 @@ module.exports = function (app, template, hook) {
   const suffix = `${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`;
   const formIds = [];
   const createForm = async (name, components, extra = {}) => {
+    const unique = `${suffix}${formIds.length}`;
     const form = await post('/form', {
       title: name,
-      name: `${name}${suffix}`,
-      path: `${name.toLowerCase()}${suffix}`,
+      name: `${name}${unique}`,
+      path: `${name.toLowerCase()}${unique}`,
       type: 'resource',
       components,
       ...extra,
@@ -457,6 +458,250 @@ module.exports = function (app, template, hook) {
       assert.deepStrictEqual(asUser.data.lines, []);
       const asAdmin = await prefill(openOrder, { customer: { _id: hidden._id }, lines: [] });
       assert.strictEqual(asAdmin.data.lines.length, 1);
+    });
+  });
+
+  describe('Linked rows - save rules', () => {
+    const put = (path, payload, status = 200, token) => call('put', path, payload, status, token);
+    const del = (path, status = 200, token) => call('delete', path, null, status, token);
+    const raw = async (id) =>
+      JSON.parse(JSON.stringify((await submissionModel().findById(id).lean()).data));
+
+    let courseForm, sectionForm, programForm, bookingForm;
+    let maths, art, mathsA, program;
+    let productForm, orderForm, flour, customer;
+    let ingredientForm, recipeForm, listForm, salt, cake, bread;
+
+    before('create the booking, order and shopping list examples', async () => {
+      courseForm = await createForm('Course', [textField('name')]);
+      sectionForm = await createForm('Section', [
+        refSelect('course', courseForm._id),
+        numberField('capacity'),
+      ]);
+      programForm = await createForm('Program', [
+        textField('name'),
+        refSelect('requiredCourses', courseForm._id, { multiple: true }),
+      ]);
+      bookingForm = await createForm(
+        'Booking',
+        [
+          refSelect('program', programForm._id),
+          grid(
+            'courses',
+            [refSelect('course', courseForm._id), refSelect('section', sectionForm._id)],
+            {
+              linkedRows: {
+                source: 'program',
+                path: 'requiredCourses',
+                map: { course: '$item' },
+                merge: 'append',
+                lock: true,
+                limit: { field: 'section', max: '$target.data.capacity' },
+              },
+            },
+          ),
+        ],
+        {
+          submissionAccess: [
+            { type: 'create_own', roles: [template.roles.authenticated._id] },
+            { type: 'read_own', roles: [template.roles.authenticated._id] },
+            { type: 'update_own', roles: [template.roles.authenticated._id] },
+            { type: 'delete_own', roles: [template.roles.authenticated._id] },
+          ],
+        },
+      );
+      maths = await post(`/form/${courseForm._id}/submission`, { data: { name: 'Maths' } });
+      art = await post(`/form/${courseForm._id}/submission`, { data: { name: 'Art' } });
+      mathsA = await post(`/form/${sectionForm._id}/submission`, {
+        data: { course: { _id: maths._id }, capacity: 1 },
+      });
+      program = await post(`/form/${programForm._id}/submission`, {
+        data: { name: 'Science', requiredCourses: [{ _id: maths._id }] },
+      });
+
+      productForm = await createForm('Product', [textField('name'), numberField('price')]);
+      const customerForm = await createForm('Customer', [
+        refSelect('defaultProducts', productForm._id, { multiple: true }),
+      ]);
+      orderForm = await createForm('Order', [
+        refSelect('customer', customerForm._id),
+        grid('lines', [refSelect('product', productForm._id), numberField('price')], {
+          linkedRows: {
+            source: 'customer',
+            path: 'defaultProducts',
+            map: { product: '$item', price: '$item.data.price' },
+            readOnly: ['price'],
+          },
+        }),
+      ]);
+      flour = await post(`/form/${productForm._id}/submission`, {
+        data: { name: 'Flour', price: 3 },
+      });
+      customer = await post(`/form/${customerForm._id}/submission`, {
+        data: { defaultProducts: [{ _id: flour._id }] },
+      });
+
+      ingredientForm = await createForm('Ingredient', [textField('name')]);
+      recipeForm = await createForm('Recipe', [
+        numberField('servings'),
+        grid('ingredients', [
+          refSelect('ingredient', ingredientForm._id),
+          numberField('qty'),
+          textField('unit'),
+        ]),
+      ]);
+      listForm = await createForm('ShoppingList', [
+        grid('recipes', [refSelect('recipe', recipeForm._id), numberField('servings')]),
+        grid(
+          'items',
+          [refSelect('ingredient', ingredientForm._id), numberField('qty'), textField('unit')],
+          {
+            linkedRows: {
+              source: 'recipes.recipe',
+              path: 'ingredients',
+              map: { ingredient: '$item.ingredient', unit: '$item.unit', qty: '$item.qty' },
+              merge: 'combine',
+              key: ['ingredient', 'unit'],
+              sum: ['qty'],
+              sync: 'live',
+            },
+          },
+        ),
+      ]);
+      salt = await post(`/form/${ingredientForm._id}/submission`, { data: { name: 'Salt' } });
+      cake = await post(`/form/${recipeForm._id}/submission`, {
+        data: {
+          servings: 4,
+          ingredients: [{ ingredient: { _id: salt._id }, qty: 1, unit: 'tsp' }],
+        },
+      });
+      bread = await post(`/form/${recipeForm._id}/submission`, {
+        data: {
+          servings: 2,
+          ingredients: [{ ingredient: { _id: salt._id }, qty: 2, unit: 'tsp' }],
+        },
+      });
+    });
+
+    it('stores server-made origin markers and ignores forged ones', async () => {
+      const booking = await post(`/form/${bookingForm._id}/submission`, {
+        data: {
+          program: { _id: program._id },
+          courses: [
+            { course: { _id: maths._id }, _linked: { from: [{ record: 'forged', item: 'x' }] } },
+            {
+              course: { _id: art._id },
+              _linked: { from: [{ record: program._id, item: art._id }] },
+            },
+          ],
+        },
+      });
+      const stored = await raw(booking._id);
+      assert.deepStrictEqual(stored.courses[0]._linked, {
+        from: [{ record: program._id, item: maths._id }],
+      });
+      assert.strictEqual(stored.courses[1]._linked, undefined, 'an elective has no origin');
+    });
+
+    it('rejects a save that drops a locked row', async () => {
+      const res = await post(
+        `/form/${bookingForm._id}/submission`,
+        { data: { program: { _id: program._id }, courses: [{ course: { _id: art._id } }] } },
+        400,
+      );
+      assert.match(res.details[0].message, /required and cannot be removed/);
+    });
+
+    it('caps how many rows may link to one record, and frees places on failure and delete', async () => {
+      const booking = (section) => ({
+        data: {
+          program: { _id: program._id },
+          courses: [{ course: { _id: maths._id }, section: { _id: section } }],
+        },
+      });
+      const user = template.users.user1;
+      // A save that fails for another reason must not keep the place it reserved.
+      await post(
+        `/form/${bookingForm._id}/submission`,
+        { data: { program: { _id: program._id }, courses: [{ section: { _id: mathsA._id } }] } },
+        400,
+      );
+      const first = await post(`/form/${bookingForm._id}/submission`, booking(mathsA._id));
+      const full = await post(
+        `/form/${bookingForm._id}/submission`,
+        booking(mathsA._id),
+        400,
+        user.token,
+      );
+      assert.match(full.details[0].message, /no places left/);
+      // Moving the first booking off the section frees it.
+      await put(`/form/${bookingForm._id}/submission/${first._id}`, {
+        data: { program: { _id: program._id }, courses: [{ course: { _id: maths._id } }] },
+      });
+      const second = await post(
+        `/form/${bookingForm._id}/submission`,
+        booking(mathsA._id),
+        201,
+        user.token,
+      );
+      await del(`/form/${bookingForm._id}/submission/${second._id}`, 200, user.token);
+      await post(`/form/${bookingForm._id}/submission`, booking(mathsA._id));
+    });
+
+    it('keeps readOnly values as generated on create and as saved on update', async () => {
+      const order = await post(`/form/${orderForm._id}/submission`, {
+        data: {
+          customer: { _id: customer._id },
+          lines: [{ product: { _id: flour._id }, price: 0.01 }],
+        },
+      });
+      assert.strictEqual((await raw(order._id)).lines[0].price, 3);
+      await put(`/form/${productForm._id}/submission/${flour._id}`, {
+        data: { name: 'Flour', price: 5 },
+      });
+      await put(`/form/${orderForm._id}/submission/${order._id}`, {
+        data: {
+          customer: { _id: customer._id },
+          lines: [{ product: { _id: flour._id }, price: 99 }],
+        },
+      });
+      assert.strictEqual((await raw(order._id)).lines[0].price, 3, 'price frozen at order time');
+    });
+
+    it('pushes picks into an existing record and recomputes its grid', async () => {
+      const list = await post(`/form/${listForm._id}/submission`, {
+        data: {
+          recipes: [{ recipe: { _id: cake._id }, servings: 4 }],
+          items: [{ ingredient: { _id: salt._id }, qty: 1, unit: 'tsp' }],
+        },
+      });
+      const updated = await put(`/form/${listForm._id}/submission/${list._id}/rows/items`, {
+        data: { recipes: [{ recipe: { _id: bread._id }, servings: 2 }] },
+      });
+      assert.strictEqual(updated.data.recipes.length, 2);
+      const stored = await raw(list._id);
+      assert.deepStrictEqual(
+        stored.items.map((item) => [item.ingredient._id, item.qty, item.unit]),
+        [[salt._id, 3, 'tsp']],
+      );
+      assert.strictEqual(stored.items[0]._linked.from.length, 2);
+    });
+
+    it('needs update access on the record to push into it', async () => {
+      const list = await post(`/form/${listForm._id}/submission`, {
+        data: { recipes: [], items: [] },
+      });
+      await put(
+        `/form/${listForm._id}/submission/${list._id}/rows/items`,
+        { data: { recipes: [{ recipe: { _id: bread._id }, servings: 2 }] } },
+        401,
+        template.users.user1.token,
+      );
+    });
+
+    it('returns 404 for a field without linked rows', async () => {
+      const list = await post(`/form/${listForm._id}/submission`, { data: { recipes: [] } });
+      await put(`/form/${listForm._id}/submission/${list._id}/rows/recipes`, { data: {} }, 404);
     });
   });
 };
