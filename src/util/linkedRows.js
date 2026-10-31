@@ -212,8 +212,20 @@ const userColumns = (settings, row) => _.omit(row, [...Object.keys(settings.map)
  * @param generated Rows built from every currently picked record, in pick order.
  * @return {Array} the grid's new rows
  */
+// A row with no values (a grid's default blank row) carries nothing worth keeping.
+const isBlankValue = (value) =>
+  value === null ||
+  value === undefined ||
+  value === '' ||
+  value === false ||
+  (Array.isArray(value) && !value.length) ||
+  (isRecord(value) && !Object.keys(value).length);
+const isBlankRow = (row) =>
+  !isRecord(row) ||
+  Object.entries(row).every(([key, value]) => key === LINKED_KEY || isBlankValue(value));
+
 const mergeRows = (settings, currentRows, generated) => {
-  const current = Array.isArray(currentRows) ? currentRows : [];
+  const current = (Array.isArray(currentRows) ? currentRows : []).filter((row) => !isBlankRow(row));
   const userRows = current.filter((row) => !isRecord(row) || !row[LINKED_KEY]);
   const linkedRows = current.filter((row) => isRecord(row) && row[LINKED_KEY]);
 

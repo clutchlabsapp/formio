@@ -170,6 +170,18 @@ module.exports = function (app, template, hook) {
       _linked: { from: [{ record, item }] },
     });
 
+    it("ignores blank rows, such as a grid's default empty row", () => {
+      const blank = { item: null, qty: '', done: false, tags: [] };
+      const fill = settingsFor({ merge: 'fillIfEmpty' });
+      assert.deepStrictEqual(linkedRowsLib.mergeRows(fill, [blank], [row('r', 'a')]), [
+        row('r', 'a'),
+      ]);
+      const append = settingsFor({ merge: 'append' });
+      assert.deepStrictEqual(linkedRowsLib.mergeRows(append, [blank], [row('r', 'a')]), [
+        row('r', 'a'),
+      ]);
+    });
+
     it('fillIfEmpty only fills an empty grid', () => {
       const settings = settingsFor({ merge: 'fillIfEmpty' });
       assert.deepStrictEqual(linkedRowsLib.mergeRows(settings, [], [row('r', 'a')]), [
