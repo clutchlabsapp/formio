@@ -55,6 +55,12 @@ export const FormMenu = ({
             View Data
           </button>
           <button
+            className={`menu-item enter-data${location === '/report' ? ' active' : ''}`}
+            onClick={() => menuItemClick('/report')}
+          >
+            Reports
+          </button>
+          <button
             className={`menu-item enter-data${location === '/actions' ? ' active' : ''}`}
             onClick={() => menuItemClick('/actions')}
           >

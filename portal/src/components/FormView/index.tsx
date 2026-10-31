@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { Params, Route, Switch } from 'wouter';
 import { EnterData } from './EnterData';
 import { ViewData } from './ViewData';
+import { Reports } from './Reports';
 import { EditForm } from './EditForm';
 import { FormActions } from './FormActions';
 import { FormAccess } from './FormAccess';
@@ -63,6 +64,9 @@ export const FormView = ({
         </Route>
         <Route path="/view">
           <ViewData formId={id} />
+        </Route>
+        <Route path="/report">
+          <Reports formId={id} />
         </Route>
         <Route path="/edit">
           <EditForm type={type} url={formUrl} onSaveForm={onSaveForm} />

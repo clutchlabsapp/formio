@@ -229,7 +229,8 @@ test('Clicking on view data loads submissions', async () => {
   await userEvent.click(viewDataTab);
   expect(Array.from(viewDataTab.classList)).contains('active');
   expect(window.location.href).to.include('/view');
-  expect(await screen.findByText('Text Field'));
+  // The label also appears in the sort and filter menus; check the table header.
+  expect(await screen.findByText('Text Field', { selector: '.tcol' }));
   expect(await screen.findByText('test1'));
   expect(await screen.findByText('test2'));
 });
