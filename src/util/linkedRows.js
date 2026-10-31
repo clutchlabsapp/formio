@@ -70,6 +70,41 @@ const isRecord = (value) => value && typeof value === 'object' && !Array.isArray
 const asLink = (value) =>
   isRecord(value) && value._id && (value.data || value.form) ? { _id: value._id } : value;
 
+// The form builder stores values as text: "1", "true" and '{"multiply": [...]}' are read as
+// JSON; anything else ("$item.data.price", "each") stays a string.
+const parseBuilderValue = (value) => {
+  if (typeof value !== 'string') {
+    return value;
+  }
+  const text = value.trim();
+  if (
+    /^[{[]/.test(text) ||
+    /^-?\d+(\.\d+)?$/.test(text) ||
+    ['true', 'false', 'null'].includes(text)
+  ) {
+    try {
+      return JSON.parse(text);
+    } catch (err) {
+      return value;
+    }
+  }
+  return value;
+};
+
+// `map` as an object, or as the builder's list of { column, value } rows.
+const normalizeMap = (map) => {
+  if (!Array.isArray(map)) {
+    return map;
+  }
+  const result = {};
+  map.forEach((entry) => {
+    if (isRecord(entry) && typeof entry.column === 'string' && entry.column) {
+      result[entry.column] = parseBuilderValue(entry.value);
+    }
+  });
+  return result;
+};
+
 /**
  * Check a linkedRows setting and fill in defaults. Returns { settings } or { error }.
  */
@@ -77,17 +112,21 @@ const normalizeSettings = (raw) => {
   if (!isRecord(raw)) {
     return { error: 'linkedRows must be an object' };
   }
+  const limit =
+    isRecord(raw.limit) && typeof raw.limit.field === 'string' && raw.limit.field
+      ? { field: raw.limit.field, max: parseBuilderValue(raw.limit.max) }
+      : null;
   const settings = {
     source: raw.source,
     path: raw.path,
-    map: raw.map,
+    map: normalizeMap(raw.map),
     merge: raw.merge || 'fillIfEmpty',
     key: Array.isArray(raw.key) ? raw.key : [],
     sum: Array.isArray(raw.sum) ? raw.sum : [],
     sync: raw.sync || 'onPick',
     lock: raw.lock === true,
     readOnly: Array.isArray(raw.readOnly) ? raw.readOnly : [],
-    limit: isRecord(raw.limit) ? raw.limit : null,
+    limit,
   };
   if (typeof settings.source !== 'string' || !settings.source) {
     return { error: 'linkedRows.source must name a reference component' };

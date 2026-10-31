@@ -72,6 +72,35 @@ module.exports = function (app, template, hook) {
       assert.strictEqual(settings.sync, 'onPick');
     });
 
+    it("accepts the form builder's list-of-columns map and text values", () => {
+      const { settings } = linkedRowsLib.normalizeSettings({
+        source: 'customer',
+        path: 'defaultProducts',
+        map: [
+          { column: 'product', value: '$item' },
+          { column: 'qty', value: '1' },
+          { column: 'total', value: '{"multiply": ["$item.data.price", 2]}' },
+          { column: 'note', value: 'each' },
+          { column: '', value: 'ignored' },
+        ],
+        limit: { field: 'section', max: '20' },
+      });
+      assert.deepStrictEqual(settings.map, {
+        product: '$item',
+        qty: 1,
+        total: { multiply: ['$item.data.price', 2] },
+        note: 'each',
+      });
+      assert.deepStrictEqual(settings.limit, { field: 'section', max: 20 });
+      const empty = linkedRowsLib.normalizeSettings({
+        source: 'a',
+        path: 'b',
+        map: { x: 1 },
+        limit: { field: '', max: '' },
+      });
+      assert.strictEqual(empty.settings.limit, null);
+    });
+
     it('rejects settings it cannot run', () => {
       const bad = [
         {},
