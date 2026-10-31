@@ -8,6 +8,52 @@ const ResourceFactory = require('resourcejs');
 
 module.exports = (router) => {
   const hook = require('../util/hook')(router.formio);
+  const linked = require('../util/linkedRecords')(router);
+
+  // Export options beyond the format: `savedView=<name>` applies a view saved on the form
+  // (form.settings.views[]: { name, filters, expand, unwind }), `expand=a,b.c` replaces
+  // references with live records the caller may read, `unwind=<grid>` writes one row per line
+  // of that grid. Taken off the query so they are never read as filters.
+  const takeExportOptions = (req, form, logger) => {
+    const options = { expand: [], unwind: null };
+    const viewName = req.query.savedView;
+    delete req.query.savedView;
+    if (viewName) {
+      const view = _.find(_.get(form, 'settings.views', []), { name: String(viewName) });
+      if (!view) {
+        return { error: `No saved view named ${viewName}` };
+      }
+      logger.debug({ formId: form._id, view: view.name }, 'export using saved view');
+      // Filters from the view apply unless the request sets the same parameter.
+      req.query = { ..._.pickBy(view.filters || {}, (value) => value !== undefined), ...req.query };
+      if (view.expand && !req.query.expand) {
+        req.query.expand = [].concat(view.expand).join(',');
+      }
+      if (view.unwind && !req.query.unwind) {
+        req.query.unwind = view.unwind;
+      }
+    }
+    options.expand = linked.takeExpandParam(req);
+    if (req.query.unwind) {
+      const unwind = String(req.query.unwind).replace(/^data\./, '');
+      delete req.query.unwind;
+      let isGrid = false;
+      router.formio.util.FormioUtils.eachComponent(
+        form.components,
+        (component, path) => {
+          if (path === unwind && ['datagrid', 'editgrid'].includes(component.type)) {
+            isGrid = true;
+          }
+        },
+        true,
+      );
+      if (!isGrid) {
+        return { error: 'unwind must name a grid of this form' };
+      }
+      options.unwind = unwind;
+    }
+    return { options };
+  };
 
   const resource = ResourceFactory(
     router,
@@ -39,6 +85,11 @@ module.exports = (router) => {
       const form = await router.formio.cache.loadCurrentForm(req);
       if (!form) {
         return res.sendStatus(404);
+      }
+
+      const { options: exportOptions, error: optionsError } = takeExportOptions(req, form, logger);
+      if (optionsError) {
+        return res.status(400).send(optionsError);
       }
 
       // Allow them to provide a query.
@@ -206,13 +257,32 @@ module.exports = (router) => {
                 // Doesn`t write to stream before promise resolve
                 this.pause();
                 promises.push(
-                  addSubData(row.data).then((data) => {
-                    row.data = data;
-                    // Resumes writing to stream
-                    this.resume();
-                    router.formio.util.removeProtectedFields(form, 'export', row);
-                    this.queue(row);
-                  }),
+                  (exportOptions.expand.length
+                    ? linked
+                        .expandSubmissions(req, form, [row], exportOptions.expand, logger)
+                        .catch((err) => logger.error({ err }, 'export could not expand a row'))
+                    : Promise.resolve()
+                  )
+                    .then(() => addSubData(row.data))
+                    .then((data) => {
+                      row.data = data;
+                      // Resumes writing to stream
+                      this.resume();
+                      router.formio.util.removeProtectedFields(form, 'export', row);
+                      if (!exportOptions.unwind) {
+                        return this.queue(row);
+                      }
+                      // One output row per grid line; a submission with no lines keeps one row.
+                      const lines = _.get(row.data, exportOptions.unwind);
+                      if (!Array.isArray(lines) || !lines.length) {
+                        return this.queue(row);
+                      }
+                      lines.forEach((line) => {
+                        const copy = { ...row, data: { ...row.data } };
+                        _.set(copy.data, exportOptions.unwind, [line]);
+                        this.queue(copy);
+                      });
+                    }),
                 );
               }),
               { end: false },

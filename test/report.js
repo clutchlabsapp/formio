@@ -158,4 +158,74 @@ module.exports = function (app, template, hook) {
     });
     await get(`/form/${closed._id}/report?metric=count`, 401, template.users.user1.token);
   });
+
+  describe('Export with saved views, expand and unwind', () => {
+    const exportRows = async (query, status = 200) => {
+      const res = await request(app)
+        .get(url(`/form/${orderForm._id}/export?${query}`))
+        .set('x-jwt-token', adminToken())
+        .expect(status);
+      return res;
+    };
+
+    before('save a view on the order form', async () => {
+      const form = await get(`/form/${orderForm._id}`);
+      await call(
+        'put',
+        `/form/${orderForm._id}`,
+        {
+          ...form,
+          settings: {
+            ...(form.settings || {}),
+            views: [{ name: 'Open lines', filters: { 'data.status': 'open' }, unwind: 'lines' }],
+          },
+        },
+        200,
+      );
+    });
+
+    it('writes one row per grid line with unwind', async () => {
+      const res = await exportRows('format=json&unwind=lines');
+      const lines = res.body.map((row) => row.data.lines);
+      assert.strictEqual(res.body.length, 6);
+      assert.ok(lines.every((line) => line.length === 1));
+      assert.deepStrictEqual(
+        _.sortBy(lines.map((line) => line[0].price)),
+        [1, 10, 3, 4, 5, 5].sort((a, b) => a - b),
+      );
+    });
+
+    it("applies a saved view's filters and unwind", async () => {
+      const res = await exportRows('format=json&savedView=Open%20lines');
+      assert.deepStrictEqual(
+        _.sortBy(
+          res.body.map((row) => [row.data.status, row.data.lines[0].price]),
+          1,
+        ),
+        [
+          ['open', 1],
+          ['open', 3],
+          ['open', 4],
+          ['open', 5],
+          ['open', 5],
+        ],
+      );
+    });
+
+    it('unwinds CSV exports too', async () => {
+      const res = await exportRows('format=csv&unwind=lines');
+      const body = res.text.trim().split('\n');
+      assert.strictEqual(body.length, 7, 'header plus one line per grid row');
+    });
+
+    it('rejects an unknown view or a field that is not a grid', async () => {
+      await exportRows('format=json&savedView=nope', 400);
+      await exportRows('format=json&unwind=status', 400);
+    });
+
+    it('does not read its options as filters', async () => {
+      const res = await exportRows('format=json&expand=customer');
+      assert.strictEqual(res.body.length, 4);
+    });
+  });
 };

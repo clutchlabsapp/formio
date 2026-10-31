@@ -108,6 +108,11 @@ components, walk values through grid rows, load linked submissions with read_all
 - `POST /form/:formId/prefill` `{ data, changed? }` — computed rows for each linked grid.
 - `PUT /form/:formId/submission/:id/rows/:grid` `{ data: { <source>: picks } }` — merge picks into an
   existing record and save it through the normal update path (a sub-request PUT).
+- `GET /form/:formId/report` ([`src/report/report.js`](./src/report/report.js)) — grouped totals
+  (`groupBy`, `metric`, `dateBucket`, `unwind`, `limit` + normal filters). Refuses protected,
+  encrypted and password fields; read_own callers get their own totals.
+- `GET /form/:formId/export` also takes `savedView=<name>` (from `form.settings.views[]`:
+  `{ name, filters, expand, unwind }`), `expand=` and `unwind=<grid>` (one row per grid line).
 - On POST/PUT, `prepareLinkedRows` (before `submissionHandler`) enforces `lock`, `readOnly` and
   `limit`, and `restoreLinkedRows` (after it) re-attaches the server-made `_linked` row markers that
   validation strips. Link-limit counters live on the target record at `metadata.linkCounts.*`,
